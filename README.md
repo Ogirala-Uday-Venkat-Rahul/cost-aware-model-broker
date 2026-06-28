@@ -29,15 +29,15 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
    5. LLM escalation           tiny model rates difficulty            [planned]
                      |
                      v
-   Provider call (OpenRouter)  + fallback + guardrails                [planned]
+   Provider call (Groq)        + retry/backoff on 429                 [implemented]
                      |
                      v
-            { tier, word_count, reason }
+            { tier, reason, model, answer }
 ```
 
 **Key design point:** *difficulty* ("how hard is this prompt?") and *safety* ("is this prompt allowed?") are orthogonal questions — e.g. `"ignore previous instructions"` is trivial by difficulty but must be blocked. They are deliberately kept in separate layers rather than folded into one classifier.
 
-**Target model tiers** (provisional, validated against free-tier limits): cheap = Llama 3.3 70B · strong = DeepSeek R1. Both sit behind the provider layer and are swappable in one place.
+**Model tiers:** cheap = Llama 3.1 8B Instruct (Meta) · strong = Qwen3-32B (Alibaba), both served by Groq. Cross-vendor on purpose — a real broker picks the best model per tier regardless of who made it. Both sit behind the provider layer and are swappable in one place (the `MODELS` dict in `provider.py`).
 
 ---
 
@@ -47,6 +47,8 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
 - **Transparent decisions** — every routing response reports the chosen `tier`, the `word_count`, and a human-readable `reason` listing which signals fired. The decision is auditable, not a black box.
 - **Input validation** — empty or whitespace-only prompts are rejected at the front door with a `400`, so the service never spends a model call on nothing.
 - **Isolated routing logic** — the whole decision lives in one swappable `classify()` function, decoupled from the HTTP layer.
+- **Real completions with a swappable provider** — `POST /complete` classifies *and* calls the chosen model via Groq, returning the answer plus which model ran. Every model call goes through one `call_model()` function; the tier→model binding lives in a single `MODELS` dict, so swapping a model is a one-line edit.
+- **Resilient provider calls** — transient `429`s are retried with backoff that honors the provider's `Retry-After`; permanent errors (bad key/slug) fail fast, and an exhausted retry surfaces as a clean `502`.
 
 ---
 
@@ -56,8 +58,8 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
 |---|---|
 | API | FastAPI + Uvicorn |
 | Validation | Pydantic v2 |
-| Provider gateway *(planned)* | OpenRouter — one key, many models |
-| HTTP client *(planned)* | httpx |
+| Provider | Groq (OpenAI-compatible API) |
+| HTTP client | httpx |
 | Config | python-dotenv |
 
 ---
@@ -67,10 +69,11 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
 ```
 cost-aware-model-broker/
 ├── app/
-│   ├── main.py        # FastAPI app — /health and /route endpoints, input validation
-│   └── router.py      # Routing logic — classify() difficulty heuristics
+│   ├── main.py        # FastAPI app — /health, /route, /complete endpoints + validation
+│   ├── router.py      # Routing logic — classify() difficulty heuristics
+│   └── provider.py    # Provider layer — call_model() via Groq, MODELS dict, 429 backoff
 ├── requirements.txt   # Python dependencies
-├── .env               # OPENROUTER_API_KEY — never committed (see .gitignore)
+├── .env               # GROQ_API_KEY — never committed (see .gitignore)
 └── .gitignore
 ```
 
@@ -89,21 +92,28 @@ cd cost-aware-model-broker
 pip install -r requirements.txt
 ```
 
-**3. Run the API**
+**3. Add your Groq API key**
+
+Create a `.env` file in the project root (never committed — see `.gitignore`):
+```bash
+GROQ_API_KEY=your_key_here
+```
+
+**4. Run the API**
 ```bash
 uvicorn app.main:app --reload
 ```
 
 Interactive API docs at `http://localhost:8000/docs`.
 
-**4. Try a request**
+**5. Try a request**
 ```bash
-curl -X POST http://localhost:8000/route \
+curl -X POST http://localhost:8000/complete \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain why this algorithm is slow and how to optimize it"}'
 ```
 ```json
-{ "tier": "strong", "word_count": 11, "reason": "reasoning keyword(s): why, explain, optimize, algorithm" }
+{ "tier": "strong", "reason": "reasoning keyword(s): why, explain, optimize, algorithm", "model": "qwen/qwen3-32b", "answer": "..." }
 ```
 
 ---
@@ -129,6 +139,26 @@ Classifies a prompt and returns the model tier it should be routed to.
 | `400` | Prompt is empty or whitespace-only |
 | `422` | Missing or malformed request body |
 
+### `POST /complete`
+Classifies a prompt, calls the chosen model via Groq, and returns the answer.
+
+**Request body:**
+```json
+{ "prompt": "Explain why quicksort is fast" }
+```
+
+**Response:**
+```json
+{ "tier": "strong", "reason": "reasoning keyword(s): why", "model": "qwen/qwen3-32b", "answer": "..." }
+```
+
+**Error responses:**
+| Code | Meaning |
+|---|---|
+| `400` | Prompt is empty or whitespace-only |
+| `422` | Missing or malformed request body |
+| `502` | Upstream model provider failed (e.g. rate-limited after retries) |
+
 ### `GET /health`
 Liveness check — returns `{ "status": "ok" }`.
 
@@ -142,16 +172,20 @@ Pure heuristics are free and instant but miss nuance; a pure LLM classifier catc
 **Why separate difficulty from safety?**
 Routing by difficulty answers "which model?"; safety answers "should this run at all?". A short prompt can be trivial yet malicious, so collapsing the two into one classifier produces wrong decisions. Keeping them as distinct pipeline stages keeps each one simple and independently testable.
 
-**Why OpenRouter as the provider?**
-Since this project *is* a model broker, fronting many models through a single API key means switching a tier is a one-line change with no per-provider SDKs or keys to maintain — and it keeps every model call behind the one thin layer the service controls.
+**Why Groq as the provider?**
+Groq serves many models (from several vendors — Meta, Alibaba, OpenAI and more) behind one OpenAI-compatible API and a single key, so switching a tier is a one-line change with no per-provider SDKs to maintain — and every model call stays behind the one thin layer the service controls. It's also fast and has a usable free tier, which keeps the demo reliable. The cheap and strong tiers deliberately use models from *different* vendors (Meta vs Alibaba): a real broker should pick the best model per tier regardless of who made it.
+
+**Why handle reasoning models specially?**
+The strong tier (Qwen3) is a reasoning model — left alone it emits a `<think>` chain that burns the token budget and can be cut off before the answer. The provider layer sets `reasoning_effort="none"` for that model to get a direct answer. The cheap model rejects that parameter, which is exactly why per-model request params live *with* the model in the `MODELS` config rather than being sent globally.
 
 ---
 
 ## Roadmap
 
+- [x] Provider call via Groq (`/complete`) + retry/backoff on transient `429`
 - [ ] Safety gate — prompt-injection / PII / malware filtering (layer 2)
 - [ ] Intent shortcut — canned responses for fixed intents, no LLM (layer 3)
 - [ ] LLM-classifier escalation for ambiguous prompts (layer 5)
-- [ ] Provider call via OpenRouter + cross-model fallback
+- [ ] Cross-model fallback to a differently-budgeted model on failure
 - [ ] Guardrails — `max_tokens` ceiling, rate limiter, global daily cap
 - [ ] Live hosted demo
