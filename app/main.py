@@ -5,6 +5,7 @@ import httpx
 from app.router import classify
 from app.provider import call_model, classify_with_llm
 from app.safety import is_safe
+from app.intents import match_intent
 
 app = FastAPI(title="Model-Routing Service")
 
@@ -38,6 +39,12 @@ def complete(req: RouteRequest):
     safety = is_safe(prompt)
     if not safety["allowed"]:
         raise HTTPException(status_code=403, detail=f"prompt rejected by safety gate ({safety['reason']})")
+
+    # Layer 3: intent shortcut. Fixed operational intents (ping, help) get a canned
+    # answer with no model call at all, the cheapest possible path.
+    canned = match_intent(prompt)
+    if canned is not None:
+        return {"tier": "shortcut", "reason": "matched a fixed intent", "model": None, "answer": canned}
 
     decision = classify(prompt)
     tier = decision["tier"]
