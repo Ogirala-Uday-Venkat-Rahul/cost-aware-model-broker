@@ -57,11 +57,15 @@ def _retry_after_seconds(response: httpx.Response) -> float:
         return DEFAULT_BACKOFF
 
 
-def call_model(prompt: str, tier: str) -> dict:
+def call_model(prompt: str, tier: str, temperature: float | None = None) -> dict:
     """Send the prompt to the model mapped to `tier`; return the answer + model used.
 
     Retries transient 429s (provider rate-limited) up to MAX_RETRIES, honoring the
     provider's Retry-After hint. Any other error (bad key, bad slug) fails fast.
+
+    `temperature` is optional: left as None, the model uses its own default (good
+    for creative answers). The classifier passes temperature=0 so its judgment is
+    deterministic and reproducible.
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -74,6 +78,8 @@ def call_model(prompt: str, tier: str) -> dict:
         "messages": [{"role": "user", "content": prompt}],
         **config,                  # spreads in "model" plus e.g. reasoning_effort
     }
+    if temperature is not None:    # note: `is not None`, so temperature=0 still applies
+        payload["temperature"] = temperature
 
     for attempt in range(MAX_RETRIES + 1):  # 1 initial try + MAX_RETRIES retries
         response = httpx.post(GROQ_URL, headers=headers, json=payload, timeout=60)
@@ -113,7 +119,9 @@ def classify_with_llm(prompt: str) -> str:
     never silently downgrade a hard prompt to the weak model.
     """
     judge_prompt = CLASSIFIER_INSTRUCTION.format(prompt=prompt)
-    result = call_model(judge_prompt, "cheap")   # reuse retries/auth/backoff
+    # temperature=0 -> the judge returns its single best label, not a random sample,
+    # so the same prompt always routes the same way (reproducible decisions).
+    result = call_model(judge_prompt, "cheap", temperature=0)
     reply = result["answer"].strip().lower()
 
     # Check "strong" first so that a hedged reply mentioning both words
