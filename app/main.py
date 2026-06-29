@@ -4,6 +4,7 @@ import httpx
 
 from app.router import classify
 from app.provider import call_model, classify_with_llm
+from app.safety import is_safe
 
 app = FastAPI(title="Model-Routing Service")
 
@@ -30,6 +31,13 @@ def complete(req: RouteRequest):
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt must not be empty")
+
+    # Layer 2: safety gate. Reject prompt-injection attempts before spending any
+    # model call. 403 = "understood, but not allowed to run", not a 400/422 input
+    # error and not a 5xx server fault.
+    safety = is_safe(prompt)
+    if not safety["allowed"]:
+        raise HTTPException(status_code=403, detail=f"prompt rejected by safety gate ({safety['reason']})")
 
     decision = classify(prompt)
     tier = decision["tier"]
