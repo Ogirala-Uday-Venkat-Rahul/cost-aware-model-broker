@@ -21,6 +21,15 @@ MAX_RETRIES = 3        # total attempts = 1 original + up to 3 retries
 DEFAULT_BACKOFF = 2    # seconds to wait if the provider gives no Retry-After hint
 MAX_BACKOFF = 10       # never sleep longer than this on a single wait, so a request can't hang
 
+# Output-length guardrail. max_tokens caps how much the model may GENERATE on one
+# call, so the cost of a single response has a hard ceiling no matter how the user
+# phrases the request ("write a book about Rome" can't run up thousands of tokens).
+# DEFAULT applies to every answer call automatically — a forgotten limit must never
+# mean an unbounded one. The judge call overrides it with a tiny ceiling because it
+# only ever replies one word ("cheap"/"strong"), which keeps escalation genuinely cheap.
+DEFAULT_MAX_TOKENS = 1024  # answer ceiling: generous enough for real answers, still bounded
+JUDGE_MAX_TOKENS = 8       # the classifier needs one word; never let it write an essay
+
 # tier -> Groq model slug (the single place a tier is bound to a concrete model).
 # Cross-vendor on purpose: cheap is Meta, strong is Alibaba — a real broker picks
 # the best model per tier regardless of who made it. Slugs come from Groq's live
@@ -57,7 +66,12 @@ def _retry_after_seconds(response: httpx.Response) -> float:
         return DEFAULT_BACKOFF
 
 
-def call_model(prompt: str, tier: str, temperature: float | None = None) -> dict:
+def call_model(
+    prompt: str,
+    tier: str,
+    temperature: float | None = None,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> dict:
     """Send the prompt to the model mapped to `tier`; return the answer + model used.
 
     Retries transient 429s (provider rate-limited) up to MAX_RETRIES, honoring the
@@ -66,6 +80,10 @@ def call_model(prompt: str, tier: str, temperature: float | None = None) -> dict
     `temperature` is optional: left as None, the model uses its own default (good
     for creative answers). The classifier passes temperature=0 so its judgment is
     deterministic and reproducible.
+
+    `max_tokens` caps how much the model may generate. It defaults to DEFAULT_MAX_TOKENS
+    so every call is bounded even if the caller forgets — the judge call passes a small
+    value because it only needs one word back.
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -76,6 +94,7 @@ def call_model(prompt: str, tier: str, temperature: float | None = None) -> dict
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,  # hard ceiling on generated tokens for this call
         **config,                  # spreads in "model" plus e.g. reasoning_effort
     }
     if temperature is not None:    # note: `is not None`, so temperature=0 still applies
@@ -121,7 +140,9 @@ def classify_with_llm(prompt: str) -> str:
     judge_prompt = CLASSIFIER_INSTRUCTION.format(prompt=prompt)
     # temperature=0 -> the judge returns its single best label, not a random sample,
     # so the same prompt always routes the same way (reproducible decisions).
-    result = call_model(judge_prompt, "cheap", temperature=0)
+    # max_tokens=JUDGE_MAX_TOKENS -> it only has to say one word, so cap it tiny and
+    # keep the escalation call cheap (it can never accidentally write a paragraph).
+    result = call_model(judge_prompt, "cheap", temperature=0, max_tokens=JUDGE_MAX_TOKENS)
     reply = result["answer"].strip().lower()
 
     # Check "strong" first so that a hedged reply mentioning both words
