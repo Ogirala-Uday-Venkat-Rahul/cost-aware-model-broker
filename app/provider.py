@@ -88,3 +88,38 @@ def call_model(prompt: str, tier: str) -> dict:
         response.raise_for_status()  # raises on any non-2xx (incl. a final 429)
         answer = response.json()["choices"][0]["message"]["content"]
         return {"model": model, "answer": answer}
+
+
+# Layer 5: LLM-classifier escalation for the ambiguous middle.
+# When the deterministic heuristics can't decide (router returns "ambiguous"),
+# we spend ONE small call on the cheap model to break the tie. The cheap model
+# acts purely as a judge here — it never answers the user's question, it only
+# labels the difficulty. We wrap the user's prompt in a strict instruction so
+# the reply is a single word we can parse.
+CLASSIFIER_INSTRUCTION = (
+    "You are a routing classifier for an AI service. Decide whether the user's "
+    "request can be handled by a small 'cheap' model or needs a more capable "
+    "'strong' model. Consider reasoning depth, multi-step work, and nuance. "
+    "Reply with exactly one word, lowercase: cheap or strong.\n\n"
+    "User request:\n{prompt}"
+)
+
+
+def classify_with_llm(prompt: str) -> str:
+    """Resolve an 'ambiguous' prompt to a real tier via a cheap-model judge call.
+
+    Returns "cheap" or "strong". If the judge replies with anything we can't
+    read as a clear tier, we fail safe to "strong" — a broken classifier should
+    never silently downgrade a hard prompt to the weak model.
+    """
+    judge_prompt = CLASSIFIER_INSTRUCTION.format(prompt=prompt)
+    result = call_model(judge_prompt, "cheap")   # reuse retries/auth/backoff
+    reply = result["answer"].strip().lower()
+
+    # Check "strong" first so that a hedged reply mentioning both words
+    # ("not cheap, use strong") biases to strong — same fail-safe direction.
+    if "strong" in reply:
+        return "strong"
+    if "cheap" in reply:
+        return "cheap"
+    return "strong"  # unparseable judge output -> fail safe on quality

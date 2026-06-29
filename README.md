@@ -26,7 +26,7 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
    4. Difficulty classifier    cheap vs strong  (hybrid heuristics)   [implemented]
                      |  (ambiguous)
                      v
-   5. LLM escalation           tiny model rates difficulty            [planned]
+   5. LLM escalation           cheap model judges difficulty          [implemented]
                      |
                      v
    Provider call (Groq)        + retry/backoff on 429                 [implemented]
@@ -43,8 +43,9 @@ A request flows through an ordered pipeline; each stage answers exactly one ques
 
 ## What works today
 
-- **Hybrid difficulty routing (heuristics layer)** — deterministic signals (prompt length, reasoning keywords, presence of a code block) classify the obvious cases for free, with no LLM call. The ambiguous middle is what later escalates to a small LLM classifier.
-- **Transparent decisions** — every routing response reports the chosen `tier`, the `word_count`, and a human-readable `reason` listing which signals fired. The decision is auditable, not a black box.
+- **Hybrid difficulty routing** — deterministic signals (reasoning keywords, code block, prompt length) classify the obvious cases for free, with no LLM call. Definitive signals → `strong` at any length; otherwise length decides three ways against two knobs (`≤10` words → `cheap`, `>40` → `strong`, the middle band → `ambiguous`).
+- **LLM-classifier escalation (the hybrid's second half)** — `ambiguous` prompts spend *one* call on the cheap model acting as a difficulty *judge* ("reply one word: cheap or strong"), then route to its verdict. Unparseable judgments fail safe to `strong`. This catches hard prompts phrased in plain words that keyword heuristics miss, without paying for an LLM call on every request.
+- **Transparent decisions** — every routing response reports the chosen `tier`, the `word_count`, and a human-readable `reason` listing which signals fired (and, when escalated, that the judge decided). The decision is auditable, not a black box.
 - **Input validation** — empty or whitespace-only prompts are rejected at the front door with a `400`, so the service never spends a model call on nothing.
 - **Isolated routing logic** — the whole decision lives in one swappable `classify()` function, decoupled from the HTTP layer.
 - **Real completions with a swappable provider** — `POST /complete` classifies *and* calls the chosen model via Groq, returning the answer plus which model ran. Every model call goes through one `call_model()` function; the tier→model binding lives in a single `MODELS` dict, so swapping a model is a one-line edit.
@@ -130,7 +131,7 @@ Classifies a prompt and returns the model tier it should be routed to.
 
 **Response:**
 ```json
-{ "tier": "cheap", "word_count": 6, "reason": "no strong signals" }
+{ "tier": "cheap", "word_count": 6, "reason": "no signals, short (6 <= 10 words)" }
 ```
 
 **Error responses:**
@@ -149,7 +150,12 @@ Classifies a prompt, calls the chosen model via Groq, and returns the answer.
 
 **Response:**
 ```json
-{ "tier": "strong", "reason": "reasoning keyword(s): why", "model": "qwen/qwen3-32b", "answer": "..." }
+{ "tier": "strong", "reason": "reasoning keyword(s): why, explain", "model": "qwen/qwen3-32b", "answer": "..." }
+```
+
+When the heuristics can't decide, the response shows the escalation trail — the cheap-model judge's verdict:
+```json
+{ "tier": "strong", "reason": "ambiguous heuristics (no signals, mid-length (27 words) -> needs LLM judge) -> LLM judged 'strong'", "model": "qwen/qwen3-32b", "answer": "..." }
 ```
 
 **Error responses:**
@@ -167,7 +173,7 @@ Liveness check — returns `{ "status": "ok" }`.
 ## Key Design Decisions
 
 **Why hybrid routing (heuristics + LLM escalation) instead of one or the other?**
-Pure heuristics are free and instant but miss nuance; a pure LLM classifier catches nuance but adds an LLM call — and its cost — to *every* request, undercutting the whole point. The hybrid keeps the common path free, and only the prompts the heuristics can't confidently place pay for a (cheap, tightly capped) LLM judgment. The strategy lives behind one `classify()` function, so it can be tuned or replaced without touching the rest of the service.
+Pure heuristics are free and instant but miss nuance; a pure LLM classifier catches nuance but adds an LLM call — and its cost — to *every* request, undercutting the whole point. The hybrid keeps the common path free, and only the prompts the heuristics can't confidently place pay for a cheap LLM judgment. The deterministic heuristics live in one pure `classify()` function; the LLM judge lives in the provider layer (`classify_with_llm`), so each half can be tuned or replaced without touching the rest of the service.
 
 **Why separate difficulty from safety?**
 Routing by difficulty answers "which model?"; safety answers "should this run at all?". A short prompt can be trivial yet malicious, so collapsing the two into one classifier produces wrong decisions. Keeping them as distinct pipeline stages keeps each one simple and independently testable.
@@ -185,7 +191,7 @@ The strong tier (Qwen3) is a reasoning model — left alone it emits a `<think>`
 - [x] Provider call via Groq (`/complete`) + retry/backoff on transient `429`
 - [ ] Safety gate — prompt-injection / PII / malware filtering (layer 2)
 - [ ] Intent shortcut — canned responses for fixed intents, no LLM (layer 3)
-- [ ] LLM-classifier escalation for ambiguous prompts (layer 5)
+- [x] LLM-classifier escalation for ambiguous prompts (layer 5)
 - [ ] Cross-model fallback to a differently-budgeted model on failure
 - [ ] Guardrails — `max_tokens` ceiling, rate limiter, global daily cap
 - [ ] Live hosted demo

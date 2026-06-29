@@ -3,7 +3,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.router import classify
-from app.provider import call_model
+from app.provider import call_model, classify_with_llm
 
 app = FastAPI(title="Model-Routing Service")
 
@@ -32,16 +32,25 @@ def complete(req: RouteRequest):
         raise HTTPException(status_code=400, detail="prompt must not be empty")
 
     decision = classify(prompt)
+    tier = decision["tier"]
+    reason = decision["reason"]
+
     try:
-        result = call_model(prompt, decision["tier"])
+        # Layer 5: heuristics couldn't decide -> spend one cheap judge call to
+        # resolve the tie before committing to a model. Both this judge call and
+        # the answer call below are provider calls, so they share the 502 handler.
+        if tier == "ambiguous":
+            tier = classify_with_llm(prompt)
+            reason = f"ambiguous heuristics ({decision['reason']}) -> LLM judged '{tier}'"
+        result = call_model(prompt, tier)
     except httpx.HTTPStatusError as exc:
         # the upstream model provider failed (bad key, bad slug, rate limit) ->
         # surface it as 502 Bad Gateway, not a generic 500
         raise HTTPException(status_code=502, detail=f"provider error: {exc}")
 
     return {
-        "tier": decision["tier"],
-        "reason": decision["reason"],
+        "tier": tier,
+        "reason": reason,
         "model": result["model"],
         "answer": result["answer"],
     }
