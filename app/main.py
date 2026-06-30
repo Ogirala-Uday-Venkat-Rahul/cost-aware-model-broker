@@ -9,6 +9,7 @@ from app.provider import call_model, classify_with_llm
 from app.safety import is_safe
 from app.intents import match_intent
 from app.ratelimit import check_rate_limit
+from app.dailycap import check_daily_cap
 
 app = FastAPI(title="Model-Routing Service")
 
@@ -75,6 +76,22 @@ def complete(req: RouteRequest, request: Request):
     canned = match_intent(prompt)
     if canned is not None:
         return {"tier": "shortcut", "reason": "matched a fixed intent", "model": None, "answer": canned}
+
+    # Guardrail 3: global daily cap. Placed here -- after the free intent shortcut --
+    # so only requests that actually reach a model count against the day's budget;
+    # a canned "ping" costs nothing and shouldn't burn the quota. This bounds total
+    # provider spend across all callers, a different bound from the per-client limit.
+    cap = check_daily_cap()
+    if not cap["allowed"]:
+        # Retry-After must be seconds (HTTP spec) so clients can auto-wait, but the
+        # human-readable message rounds it to hours/minutes until the UTC reset.
+        retry = cap["retry_after"]
+        hours, minutes = retry // 3600, (retry % 3600) // 60
+        raise HTTPException(
+            status_code=429,
+            detail=f"daily capacity reached; resets at UTC midnight (~{hours}h {minutes}m)",
+            headers={"Retry-After": str(retry)},
+        )
 
     decision = classify(prompt)
     tier = decision["tier"]
