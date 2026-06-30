@@ -42,6 +42,10 @@ JUDGE_MAX_TOKENS = 8       # the classifier needs one word; never let it write a
 MODELS = {
     "cheap": {"model": "llama-3.1-8b-instant"},                      # Meta, 8B — small & fast
     "strong": {"model": "qwen/qwen3-32b", "reasoning_effort": "none"},  # Alibaba, 32B — stronger
+    # Not a routing tier — the reliability backup (feature 4). A general-purpose Meta
+    # 70B used only when the chosen model fails for a model-specific reason. Listing it
+    # here lets call_model drive it with the same retry/token/temperature logic.
+    "fallback": {"model": "llama-3.3-70b-versatile"},
 }
 
 
@@ -113,6 +117,40 @@ def call_model(
         response.raise_for_status()  # raises on any non-2xx (incl. a final 429)
         answer = response.json()["choices"][0]["message"]["content"]
         return {"model": model, "answer": answer}
+
+
+def _is_model_specific_failure(exc: Exception) -> bool:
+    """True if `exc` points at THIS model/endpoint, so a different model might work.
+
+    Worth a fallback: the model's server erred (5xx) or we couldn't reach it at all
+    (timeout, connection refused/reset, DNS) -- httpx.TransportError covers both of
+    those transport cases. NOT worth a fallback (return False -> fail fast): a 429
+    (our backup shares Groq's free budget, so it's throttled too -- falling back is
+    theater) or any other 4xx like 401/400 (bad key / bad request fail on any model).
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
+
+
+def call_with_fallback(prompt: str, tier: str, **kwargs) -> dict:
+    """Call the chosen tier's model; on a MODEL-SPECIFIC failure, retry once on the
+    dedicated backup model so the user still gets an answer.
+
+    Reliability is kept separate from routing on purpose: the fallback is its own
+    model, not "swap cheap<->strong", so a recovery never silently changes which
+    quality tier the user asked for. Only model-specific failures trigger it (see
+    _is_model_specific_failure); everything else re-raises and becomes a 502 upstream.
+    """
+    try:
+        return call_model(prompt, tier, **kwargs)
+    except httpx.HTTPError as exc:
+        if not _is_model_specific_failure(exc):
+            raise  # 429/401/400 -> a different model won't help; fail fast
+        # the chosen model is down or unreachable -> one attempt on the backup
+        return call_model(prompt, "fallback", **kwargs)
 
 
 # Layer 5: LLM-classifier escalation for the ambiguous middle.

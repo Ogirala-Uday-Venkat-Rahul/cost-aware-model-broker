@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.router import classify
-from app.provider import call_model, classify_with_llm
+from app.provider import call_with_fallback, classify_with_llm
 from app.safety import is_safe
 from app.intents import match_intent
 from app.ratelimit import check_rate_limit
@@ -104,10 +104,11 @@ def complete(req: RouteRequest, request: Request):
         if tier == "ambiguous":
             tier = classify_with_llm(prompt)
             reason = f"ambiguous heuristics ({decision['reason']}) -> LLM judged '{tier}'"
-        result = call_model(prompt, tier)
-    except httpx.HTTPStatusError as exc:
-        # the upstream model provider failed (bad key, bad slug, rate limit) ->
-        # surface it as 502 Bad Gateway, not a generic 500
+        result = call_with_fallback(prompt, tier)
+    except httpx.HTTPError as exc:
+        # the upstream provider failed and (for model-specific faults) the backup
+        # failed too -- bad key, bad slug, rate limit, or an unreachable endpoint.
+        # Surface it as 502 Bad Gateway, not a generic 500: the fault is upstream.
         raise HTTPException(status_code=502, detail=f"provider error: {exc}")
 
     return {
