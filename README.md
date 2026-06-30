@@ -85,6 +85,7 @@ cost-aware-model-broker/
 │   ├── intents.py     # match_intent(): canned answers for fixed prompts (layer 3)
 │   ├── ratelimit.py   # per-IP token bucket in Redis (guardrail)
 │   └── dailycap.py    # global daily request cap in Redis (guardrail)
+├── streamlit_app.py   # Streamlit front end: a router console over /complete
 ├── requirements.txt
 ├── .env               # GROQ_API_KEY + Upstash Redis creds, never committed
 └── .gitignore
@@ -122,7 +123,13 @@ uvicorn app.main:app --reload
 
 Interactive API docs at `http://localhost:8000/docs`.
 
-**5. Try a request**
+**5. Run the UI** (optional, in a second terminal)
+```bash
+streamlit run streamlit_app.py
+```
+The router console opens at `http://localhost:8501` and talks to the backend on `localhost:8000` by default. When deployed, set a `BACKEND_URL` secret pointing at the hosted API's `/complete`.
+
+**6. Try a request directly**
 ```bash
 curl -X POST http://localhost:8000/complete \
   -H "Content-Type: application/json" \
@@ -211,5 +218,5 @@ The strong tier (Qwen3) is a reasoning model: left alone it emits a `<think>` ch
 - [x] Intent shortcut: canned responses for fixed intents, no LLM (layer 3)
 - [x] Guardrails: `max_tokens` ceiling, per-IP rate limiter, global daily cap
 - [x] Model fallback on model-specific failures
-- [ ] Streamlit UI
+- [x] Streamlit UI (router console)
 - [ ] Live hosted demo
