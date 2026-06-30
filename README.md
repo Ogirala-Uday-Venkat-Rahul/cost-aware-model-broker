@@ -210,6 +210,31 @@ The strong tier (Qwen3) is a reasoning model: left alone it emits a `<think>` ch
 
 ---
 
+## Evaluation
+
+How do you know the routing is any good? `evals/` runs a small labeled set of prompts through the *real* routing decision (intent shortcut, heuristics, and the LLM judge) and reports how often it agrees with hand-labeled tiers, plus how much it avoids the expensive model. On the current 22-prompt set:
+
+| Metric | Result |
+|---|---|
+| Routing split | 41% cheap · 45% strong · 14% shortcut |
+| Agreement with hand-labeled tiers | 16/22 (73%) |
+| Requests that avoided the strong model | 12/22 (55%) |
+| Modeled spend vs all-strong (assuming strong = 10× cheap/token) | ~50% of baseline |
+
+The 73% is deliberately honest — the dataset includes the cases keyword heuristics are *known* to miss, so the score reflects real behavior rather than a curated win. The six misroutes split cleanly:
+
+- **Under-routing (3):** plainly-phrased hard prompts with no trigger word (e.g. "how does a transformer work?") get sent cheap. This is the keyword false-negative — the limitation that motivates the LLM judge.
+- **Over-routing (3):** trivial prompts that happen to contain a trigger word (e.g. "why is the sky blue?") get sent strong, plus one ambiguous prompt the judge escalated to be safe. These cost a little more but don't return *worse* answers — the errors are biased toward the safe (more expensive) direction by design.
+
+This is also the honest argument for the routing *policy* being swappable: the keyword + length heuristic is transparent and free, but a production system would replace it (a small trained classifier or an embedding-based difficulty score) behind the same `classify()` seam, and this eval is how you'd measure the upgrade.
+
+Run it yourself:
+```bash
+python -m evals.evaluate   # needs GROQ_API_KEY for the judge calls
+```
+
+---
+
 ## Roadmap
 
 - [x] Provider call via Groq (`/complete`) with retry/backoff on transient `429`
@@ -219,4 +244,5 @@ The strong tier (Qwen3) is a reasoning model: left alone it emits a `<think>` ch
 - [x] Guardrails: `max_tokens` ceiling, per-IP rate limiter, global daily cap
 - [x] Model fallback on model-specific failures
 - [x] Streamlit UI (router console)
+- [x] Routing eval (agreement + cost-avoided on a labeled set)
 - [ ] Live hosted demo
