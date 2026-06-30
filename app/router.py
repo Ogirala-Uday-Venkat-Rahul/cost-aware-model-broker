@@ -13,10 +13,11 @@ REASONING_KEYWORDS = [
     "refactor",
 ]
 
-# Two length knobs that bracket the "ambiguous" middle band:
-#   <= SHORT  -> confidently cheap (trivial), don't waste a judge call
-#   >  LONG   -> confidently strong (meaty), and the judge would have to read it all anyway
-#   in between, with no other signal -> ambiguous -> escalate to the LLM judge
+# Two length thresholds that bracket the "ambiguous" middle band. At or below
+# SHORT, a prompt is trivial enough to send cheap without paying for a judge call.
+# Above LONG, it's meaty enough to send strong (and the judge would have to read the
+# whole thing anyway). Anything in between, with no other signal, is ambiguous and
+# gets escalated to the LLM judge.
 SHORT_PROMPT_WORDS = 10
 LONG_PROMPT_WORDS = 40
 
@@ -25,8 +26,8 @@ def classify(prompt: str) -> dict:
     text = " ".join(prompt.split()).lower()
     word_count = len(text.split())
 
-    # --- Definitive signals: a reasoning keyword or a code block means the
-    # prompt is hard regardless of length, so we commit to strong immediately. ---
+    # A reasoning keyword or a code block means the prompt is hard regardless of
+    # length, so commit to strong immediately.
     matched_keywords = [word for word in REASONING_KEYWORDS if word in text]
     has_code = "```" in text
     if matched_keywords or has_code:
@@ -37,7 +38,7 @@ def classify(prompt: str) -> dict:
             parts.append("code block")
         return {"tier": "strong", "word_count": word_count, "reason": "; ".join(parts)}
 
-    # --- No definitive signal: let length decide, three ways. ---
+    # No keyword or code block, so let length decide between the three outcomes.
     if word_count <= SHORT_PROMPT_WORDS:
         return {"tier": "cheap", "word_count": word_count,
                 "reason": f"no signals, short ({word_count} <= {SHORT_PROMPT_WORDS} words)"}

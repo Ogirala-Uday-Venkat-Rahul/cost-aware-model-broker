@@ -49,7 +49,7 @@ def route(req: RouteRequest):
 @app.post("/complete")
 def complete(req: RouteRequest, request: Request):
     # Guardrail 2: per-client rate limit. Runs first so request *frequency* is
-    # capped regardless of content -- an abuser can't spam the endpoint for free
+    # capped regardless of content, so an abuser can't spam the endpoint for free
     # just by sending requests that would fail validation later.
     client_ip = _client_ip(request)
     limit = check_rate_limit(client_ip)
@@ -72,14 +72,14 @@ def complete(req: RouteRequest, request: Request):
         raise HTTPException(status_code=403, detail=f"prompt rejected by safety gate ({safety['reason']})")
 
     # Layer 3: intent shortcut. Fixed operational intents (ping, help) get a canned
-    # answer with no model call at all, the cheapest possible path.
+    # answer with no model call at all.
     canned = match_intent(prompt)
     if canned is not None:
         return {"tier": "shortcut", "reason": "matched a fixed intent", "model": None, "answer": canned}
 
-    # Guardrail 3: global daily cap. Placed here -- after the free intent shortcut --
-    # so only requests that actually reach a model count against the day's budget;
-    # a canned "ping" costs nothing and shouldn't burn the quota. This bounds total
+    # Guardrail 3: global daily cap. Placed here, after the free intent shortcut, so
+    # only requests that actually reach a model count against the day's budget; a
+    # canned "ping" costs nothing and shouldn't burn the quota. This bounds total
     # provider spend across all callers, a different bound from the per-client limit.
     cap = check_daily_cap()
     if not cap["allowed"]:
@@ -98,7 +98,7 @@ def complete(req: RouteRequest, request: Request):
     reason = decision["reason"]
 
     try:
-        # Layer 5: heuristics couldn't decide -> spend one cheap judge call to
+        # Layer 5: heuristics couldn't decide, so spend one cheap judge call to
         # resolve the tie before committing to a model. Both this judge call and
         # the answer call below are provider calls, so they share the 502 handler.
         if tier == "ambiguous":
@@ -107,8 +107,8 @@ def complete(req: RouteRequest, request: Request):
         result = call_with_fallback(prompt, tier)
     except httpx.HTTPError as exc:
         # the upstream provider failed and (for model-specific faults) the backup
-        # failed too -- bad key, bad slug, rate limit, or an unreachable endpoint.
-        # Surface it as 502 Bad Gateway, not a generic 500: the fault is upstream.
+        # failed too: a bad key, bad slug, rate limit, or an unreachable endpoint.
+        # Surface it as 502 Bad Gateway, not a generic 500, since the fault is upstream.
         raise HTTPException(status_code=502, detail=f"provider error: {exc}")
 
     return {

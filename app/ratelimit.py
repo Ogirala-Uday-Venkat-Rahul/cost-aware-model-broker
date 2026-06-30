@@ -2,23 +2,25 @@
 
 This bounds how *often* one client can call, which is a different concern from
 max_tokens (how *long* one answer can be). A "token" here is a permission ticket,
-one per request -- nothing to do with LLM tokens.
+one per request, and has nothing to do with LLM tokens.
 
-Why a token bucket: each client gets a bucket holding up to CAPACITY tickets that
-refills at a steady rate. It tolerates a short burst (up to capacity) then meters
-the client to the sustained rate -- friendlier to real bursty clients than a fixed
-window (which resets on a clock and can be gamed at the boundary) or a plain
-sliding window (which punishes any quick flurry).
+Each client gets a bucket holding up to CAPACITY tickets that refills at a steady
+rate. It tolerates a short burst, up to capacity, then meters the client to the
+sustained rate. That's friendlier to real bursty clients than a fixed window, which
+resets on a clock and can be gamed at the boundary, or a plain sliding window, which
+punishes any quick flurry.
 
-Why Redis: an in-memory counter is wrong the moment the app runs more than one
-worker process -- each worker would keep its own count and the real limit would
-multiply by the worker count. Redis gives every worker one shared bucket.
+The state lives in Redis rather than an in-memory counter, because an in-memory
+counter breaks the moment the app runs more than one worker process: each worker
+keeps its own count and the real limit multiplies by the worker count. Redis gives
+every worker one shared bucket.
 
-Why Lua: spending a ticket is read -> refill/decide -> write, three steps. Across
-workers those steps can interleave (two workers both read "1 left", both allow,
-both write "0" -> two requests on one ticket). A Lua script runs atomically on the
-Redis server, so the whole read-refill-write happens as one indivisible step and
-two workers can't spend the same ticket.
+The Lua script is what makes spending a ticket safe. Spending is three steps (read
+the tickets left, refill and decide, write the new count) and across workers those
+steps can interleave: two workers both read "1 left", both allow, both write "0",
+and two requests slip through on one ticket. A Lua script runs atomically on the
+Redis server, so the whole read-refill-write happens as one indivisible step and two
+workers can't spend the same ticket.
 """
 import time
 
@@ -33,7 +35,7 @@ REFILL_RATE = REQUESTS_PER_MINUTE / 60.0  # tickets added per second
 redis = Redis.from_env()  # reads UPSTASH_REDIS_REST_URL / _TOKEN from the environment
 
 # The bucket lives in a Redis hash per client: {tokens, ts}. This script does the
-# whole refill-then-spend atomically and returns whether the request is allowed
+# whole refill-then-spend atomically and returns whether the request is allowed,
 # plus how many seconds until the next ticket (for the Retry-After header).
 #
 # KEYS[1] = the client's bucket key
