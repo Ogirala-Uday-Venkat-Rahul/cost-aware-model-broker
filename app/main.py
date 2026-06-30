@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from math import ceil
+
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import httpx
 
@@ -6,8 +8,24 @@ from app.router import classify
 from app.provider import call_model, classify_with_llm
 from app.safety import is_safe
 from app.intents import match_intent
+from app.ratelimit import check_rate_limit
 
 app = FastAPI(title="Model-Routing Service")
+
+
+def _client_ip(request: Request) -> str:
+    """The caller's IP, accounting for the proxy the app sits behind on a host.
+
+    Behind a proxy (Render etc.) request.client.host is the *proxy's* IP, so every
+    user would look identical. The real client IP is the first entry of the
+    X-Forwarded-For chain ("client, proxy1, proxy2"). It's spoofable, so this is
+    only trustworthy because our own proxy sets it; with no proxy we fall back to
+    the direct connection IP.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
 
 
 class RouteRequest(BaseModel):
@@ -28,7 +46,19 @@ def route(req: RouteRequest):
 
 
 @app.post("/complete")
-def complete(req: RouteRequest):
+def complete(req: RouteRequest, request: Request):
+    # Guardrail 2: per-client rate limit. Runs first so request *frequency* is
+    # capped regardless of content -- an abuser can't spam the endpoint for free
+    # just by sending requests that would fail validation later.
+    client_ip = _client_ip(request)
+    limit = check_rate_limit(client_ip)
+    if not limit["allowed"]:
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded, slow down",
+            headers={"Retry-After": str(ceil(limit["retry_after"]))},
+        )
+
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt must not be empty")
