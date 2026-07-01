@@ -1,5 +1,7 @@
 # Cost-Aware Model Broker
 
+**Live demo:** https://cost-aware-model-broker.streamlit.app · **API:** https://cost-aware-model-broker.onrender.com
+
 A request broker that sits in front of multiple LLMs and routes each prompt to the **cheapest model capable of handling it**. Simple prompts go to a fast, low-cost model; hard prompts are escalated to a stronger one. Built with FastAPI, with every model call kept behind one thin layer the service controls.
 
 > **Honest framing:** this saves cost by *choosing a cheaper model per task*. It is not cheaper per token and it is not magic. The engineering is in deciding *which* tier a prompt needs, reliably and transparently.
@@ -245,4 +247,4 @@ python -m evals.evaluate   # needs GROQ_API_KEY for the judge calls
 - [x] Model fallback on model-specific failures
 - [x] Streamlit UI (router console)
 - [x] Routing eval (agreement + cost-avoided on a labeled set)
-- [ ] Live hosted demo
+- [x] Live hosted demo (Streamlit Cloud + Render)
